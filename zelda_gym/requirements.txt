@@ -1,0 +1,6 @@
+gymnasium
+numpy
+pillow
+pyautogui
+pygetwindow
+opencv-python

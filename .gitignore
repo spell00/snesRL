@@ -1,0 +1,53 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# SNES Emulator Files and Docs
+snes9x.conf
+cheats.bml
+Valid.Ext
+readme-windows.txt
+faqs-windows.txt
+changes.txt
+stderr.txt
+stdout.txt
+help_output.txt
+*.exe
+*.dll
+*.so
+*.dylib
+bsnes-plus/
+
+# SNES Resource Folders
+games/
+Saves/
+Cheats/
+Patches/
+Saves/
+retro/
+retroenv/
+stable-retro/
+
+# Training / Large Data
+Logs/
+logs/
+checkpoints/
+models/
+tmp/
+zelda_gym/logs/
+zelda_gym/models/
+zelda_gym/tmp/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# VS Code
+.vscode/
