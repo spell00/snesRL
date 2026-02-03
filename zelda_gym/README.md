@@ -14,7 +14,15 @@ This project provides a reinforcement learning environment for The Legend of Zel
    - Follow the official Microsoft guide: https://docs.microsoft.com/en-us/windows/wsl/install
    - Make sure you have a working Linux distribution (e.g., Ubuntu) installed via WSL2.
 
-2. **Install Python and dependencies**
+2. **Install system-level dependencies (Linux/WSL2)**
+   - For BizHawk headless support, install the following packages:
+     ```bash
+     sudo apt-get update
+     sudo apt-get install -y mono-complete xvfb xdotool wmctrl imagemagick x11-apps \
+                            libgdiplus libsdl2-2.0-0 libopenal1 pulseaudio alsa-utils
+     ```
+
+3. **Install Python and dependencies**
    - Set up a Python virtual environment (recommended):
      ```bash
      python3 -m venv retroenv

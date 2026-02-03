@@ -41,6 +41,7 @@ class MarioBizHawkRamEnv(gym.Env):
         self._last_emu_frame = -1
         self._stuck_steps = 0
         self._force_hard_reset = False
+        self._restart_retry_interval_s = 60
 
     def _write_action(self, button_vector, is_reset=False):
         if is_reset:
@@ -106,10 +107,13 @@ class MarioBizHawkRamEnv(gym.Env):
                     break
                 time.sleep(0.001)
             if ram_data is None:
-                self.close()
-                self._start_bizhawk()
-                time.sleep(2.0)
-                return obs, 0.0, False, False, {"error": "ram_timeout"}
+                if self._verbose:
+                    print(
+                        f"[Rank {self.rank}] RAM timeout at cmd_id={self._command_id}. "
+                        f"Restarting BizHawk every {self._restart_retry_interval_s}s until it comes back."
+                    )
+                self._restart_bizhawk_with_retry(reason="ram_timeout")
+                return obs, 0.0, False, False, {"error": "ram_timeout", "restarted": True}
             obs = np.array(ram_data, dtype=np.int32)
             score, coins, lives, level, x_pos, state, timer, game_mode, frame, cmd_id = ram_data
             if frame == self._last_emu_frame:
@@ -118,10 +122,13 @@ class MarioBizHawkRamEnv(gym.Env):
                 self._stuck_steps = 0
                 self._last_emu_frame = frame
             if self._stuck_steps > (self._frameskip * 5):
-                self.close()
-                self._start_bizhawk()
-                time.sleep(2.0)
-                return obs, 0.0, False, False, {"error": "frame_stuck"}
+                if self._verbose:
+                    print(
+                        f"[Rank {self.rank}] frame stuck. Restarting BizHawk every "
+                        f"{self._restart_retry_interval_s}s until it comes back."
+                    )
+                self._restart_bizhawk_with_retry(reason="frame_stuck")
+                return obs, 0.0, False, False, {"error": "frame_stuck", "restarted": True}
             reward = 0.0
             if self._last_x_pos is not None:
                 progress = (x_pos - self._last_x_pos)
@@ -163,6 +170,20 @@ class MarioBizHawkRamEnv(gym.Env):
             try: self._bizhawk_proc.terminate(); self._bizhawk_proc.wait(timeout=2)
             except: pass
             self._bizhawk_proc = None
+
+    def _restart_bizhawk_with_retry(self, reason: str) -> None:
+        while True:
+            try:
+                self.close()
+                self._start_bizhawk()
+                return
+            except Exception as exc:
+                if self._verbose:
+                    print(
+                        f"[Rank {self.rank}] BizHawk restart failed ({reason}): {exc}. "
+                        f"Retrying in {self._restart_retry_interval_s}s..."
+                    )
+                time.sleep(self._restart_retry_interval_s)
 
 if __name__ == "__main__":
     env = MarioBizHawkRamEnv(rank=0, headless=False)

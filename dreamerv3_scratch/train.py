@@ -17,7 +17,7 @@ class ObsWrapper(gym.ObservationWrapper):
         if isinstance(obs, tuple): obs = obs[0]
         # Resize and transpose to CHW
         obs = cv2.resize(obs, self.size, interpolation=cv2.INTER_AREA)
-        return obs.transpose(2, 0, 1)
+        return obs #.transpose(2, 0, 1)
 
 def main():
     # Hyperparameters
@@ -33,7 +33,7 @@ def main():
     env = gym.make("CartPole-v1", render_mode="rgb_array")
     env = ObsWrapper(env)
     
-    obs_shape = (3, 64, 64)
+    obs_shape = (64, 64, 1)
     action_dim = env.action_space.n
     
     agent = DreamerAgent(obs_shape, action_dim, device=device)

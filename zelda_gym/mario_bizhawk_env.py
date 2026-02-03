@@ -1,26 +1,36 @@
-import gymnasium as gym
-import numpy as np
-import subprocess
-import time
+import atexit
+import hashlib
 import os
 import random
+import shlex
+import signal
+import subprocess
+import time
+from typing import Optional
+
 import cv2
-import hashlib
+import gymnasium as gym
+import numpy as np
 
 
-# --- RewardSMW helper class ---
+
+# ---------------- Reward helper ----------------
 class RewardSMW:
     def __init__(
         self,
         progress_scale: float = 0.01,
         win_bonus: float = 1000.0,
-        death_penalty: float = -50.0,
+        death_penalty: float = -5.0,
         stuck_steps: int = 90,
         stuck_penalty: float = 0.0,
         use_novelty: bool = True,
         novelty_bonus: float = 0.01,
         novelty_max_items: int = 200_000,
         clamp_negative_progress: bool = True,
+        enable_cell_exploration: bool = False,
+        cell_bonus_mode: str = "constant",
+        exploration_bonus: float = 1.0,
+        cell_bins: tuple[int, int] = (64, 64),
     ):
         self.progress_scale = float(progress_scale)
         self.win_bonus = float(win_bonus)
@@ -33,178 +43,297 @@ class RewardSMW:
         self.novelty_max_items = int(novelty_max_items)
 
         self.clamp_negative_progress = bool(clamp_negative_progress)
+        
+        self.enable_cell_exploration = bool(enable_cell_exploration)
+        self.cell_bonus_mode = str(cell_bonus_mode)
+        self.exploration_bonus = float(exploration_bonus)
+        self.cell_bins = cell_bins
+        
         self.reset()
 
     def reset(self):
         self.best_progress = None
-        self.prev_progress = None
         self.steps_since_progress = 0
         self.seen_hashes = set()
+        
+        self._explored_cells = set()
+        self._cell_origin_x = None
+        self._cell_origin_y = None
+        self._min_y_pos = None
 
     def _extract_progress(self, ram: dict) -> float:
         x = ram.get("x_pos", None)
         if x is None:
-            raise KeyError("RewardSMW needs ram['x_pos'] (or override _extract_progress).")
+            raise KeyError("RewardSMW needs ram['x_pos'].")
         return float(x)
-
-    def _is_win(self, ram: dict, info: dict | None = None) -> bool:
-        return bool(info and info.get("win", False))
-
-    def _is_death(self, ram: dict, info: dict | None = None) -> bool:
-        return bool(info and info.get("death", False))
 
     def step_reward(
         self,
-        obs_img: np.ndarray | None,
+        obs_img: Optional[np.ndarray],
         ram: dict,
         terminated: bool,
         truncated: bool = False,
-        info: dict | None = None,
-    ) -> float:
+        info: Optional[dict] = None,
+    ) -> tuple[float, dict]:
         r = 0.0
+        extra_info = {
+            "reward_progress": 0.0,
+            "reward_novelty": 0.0,
+            "reward_cell": 0.0,
+            "reward_win": 0.0,
+            "reward_death": 0.0,
+            "reward_stuck": 0.0,
+            "new_progress": False,
+            "new_novelty": False,
+            "new_cell": False,
+        }
 
+        # 1. Progress
         progress = self._extract_progress(ram)
         if self.best_progress is None:
             self.best_progress = progress
-            self.prev_progress = progress
         else:
-            delta_best = progress - self.best_progress
-            if self.clamp_negative_progress and delta_best < 0:
-                delta_best = 0.0
-
-            if delta_best > 0:
-                r += delta_best * self.progress_scale
+            delta = progress - self.best_progress
+            if self.clamp_negative_progress and delta < 0:
+                delta = 0.0
+            if delta > 0:
+                delta_r = delta * self.progress_scale
+                r += delta_r
+                extra_info["reward_progress"] = delta_r
                 self.best_progress = progress
                 self.steps_since_progress = 0
+                extra_info["new_progress"] = True
             else:
                 self.steps_since_progress += 1
 
-            self.prev_progress = progress
-
         if self.stuck_steps > 0 and self.steps_since_progress >= self.stuck_steps:
             r += self.stuck_penalty
+            extra_info["reward_stuck"] = self.stuck_penalty
             self.steps_since_progress = 0
 
+        # 2. Novelty
         if self.use_novelty and obs_img is not None and len(self.seen_hashes) < self.novelty_max_items:
             h = hashlib.blake2b(obs_img.tobytes(), digest_size=8).hexdigest()
             if h not in self.seen_hashes:
                 self.seen_hashes.add(h)
                 r += self.novelty_bonus
+                extra_info["reward_novelty"] = self.novelty_bonus
+                extra_info["new_novelty"] = True
+        
+        # 3. Cell Exploration
+        if self.enable_cell_exploration:
+            x_pos = ram.get("x_pos")
+            y_pos = ram.get("y_pos")
+            
+            if x_pos is not None and y_pos is not None:
+                if self._cell_origin_x is None or self._cell_origin_y is None:
+                    self._cell_origin_x = x_pos
+                    self._cell_origin_y = y_pos
+                    
+                rel_x = abs(x_pos - self._cell_origin_x)
+                rel_y = abs(y_pos - self._cell_origin_y)
+                bin_x = int(rel_x // self.cell_bins[0])
+                bin_y = int(rel_y // self.cell_bins[1])
+                cell = (bin_x, bin_y)
+                
+                if self._min_y_pos is None or y_pos < self._min_y_pos:
+                    self._min_y_pos = y_pos
 
+                if cell not in self._explored_cells:
+                    self._explored_cells.add(cell)
+                    extra_info["new_cell"] = True
+                    cell_r = 0.0
+                    if self.cell_bonus_mode == "constant":
+                        cell_r = self.exploration_bonus
+                    else:
+                        dist = (bin_x**2 + bin_y**2) ** 0.5
+                        cell_r = dist * self.exploration_bonus
+                    r += cell_r
+                    extra_info["reward_cell"] = cell_r
+
+        # 4. Terminal
         done = bool(terminated or truncated)
-        if done:
-            if self._is_win(ram, info):
+        if done and info:
+            if info.get("win", False):
                 r += self.win_bonus
-            elif self._is_death(ram, info):
+                extra_info["reward_win"] = self.win_bonus
+            elif info.get("death", False):
                 r += self.death_penalty
+                extra_info["reward_death"] = self.death_penalty
 
-        return float(r)
+        return float(r), extra_info
 
 
+# ---------------- BizHawk Env ----------------
 class MarioBizHawkEnv(gym.Env):
+
+    @staticmethod
+    def discrete_action_count():
+        directions = [
+            (1,0,0,0), (0,1,0,0), (0,0,1,0), (0,0,0,1),
+            (1,0,1,0), (1,0,0,1), (0,1,1,0), (0,1,0,1), (0,0,0,0)
+        ]
+        return len(directions) * 2
     """
     BizHawk + Lua file-IPC environment.
-    Obs: 84x84 grayscale (bmp screenshot)
-    Act: Discrete or MultiBinary(8)
+
     IPC:
-      - Python writes ctrl file (ACT/LOAD/SAVE + cmd_id)
-      - Lua writes ram file "...,cmd_id" as ack
+      - Python writes ctrl file: ACT/LOAD/SAVE + cmd_id
+      - Lua writes ram file: "... , cmd_id" as ack
+      - Lua writes -888 as handshake marker once it starts.
+
+    Linux headless:
+      - uses xvfb-run + openbox so xdotool can activate modal dialogs
+      - starts BizHawk exactly once in __init__
+      - close() kills whole process group
     """
+
     metadata = {"render_modes": ["rgb_array"], "render_fps": 30}
 
-    def _atomic_write_line(self, path: str, line: str):
+    # -------- small IO utils --------
+    @staticmethod
+    def _atomic_write_line(path: str, line: str) -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp"
-        with open(tmp, "w", newline="\n") as f:
-            f.write(line)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
+        try:
+            with open(tmp, "w", newline="\n") as f:
+                f.write(line)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except FileNotFoundError:
+            with open(path, "w", newline="\n") as f:
+                f.write(line)
+                f.flush()
 
-    # Savestate auto-save logic disabled: always reload original state on reset.
-    def maybe_auto_save_savestate(self, x_pos):
-        pass
+    @staticmethod
+    def _safe_unlink(path: str) -> None:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
 
     def __init__(
         self,
-        rank=0,
-        headless=False,
-        frameskip=2,
-        screenshot_every=30,
-        obs_size=84,
-        verbose=1,
-        reset_mode="soft",
-        state_dir=None,
-        ram_timeout_s=10.0, # Increased from 4.0 to handle training lag
-        exploration_dir=None,
-        reset_timeout_s=15.0,
-        startup_sleep_s=4.0,
-        progress_per_pixel=0.0,
-        exploration_bonus=1.0,
-        coin_reward=5.0,
-        score_reward=0.01,
-        death_penalty=-500.0,
-        win_bonus=500.0,
-        stuck_penalty=0.0,
-        normalize_progress_by_frameskip=True,
-        seed=None,
-        novelty_enabled=True,
-        enable_cell_exploration=False,
-        model_name="default",
-        action_type="discrete",
-        cell_bonus_mode="linear",
+        rank: int = 0,
+        headless: bool = True,
+        frameskip: int = 2,
+        screenshot_every: int = 30,
+        obs_size: int = 84,
+        sprite_slots: int = 12,
+        verbose: int = 1,
+        reset_mode: str = "soft",
+        state_dir: Optional[str] = None,
+        ram_timeout_s: float = 10.0,
+        reset_timeout_s: float = 60.0,
+        seed: Optional[int] = None,
+        novelty_enabled: bool = True,
+        enable_cell_exploration: bool = False,
+        model_name: str = "default",
+        action_type: str = "discrete",
+        cell_bonus_mode: str = "linear",
+        bizhawk_root: Optional[str] = None,
+        rom_path: Optional[str] = None,
+        exploration_bonus: float = 1.0,
+        progress_scale: float = 0.01,
+        score_reward: float = 0.01,
+        death_penalty: float = -5.0,
+        win_bonus: float = 1000.0,
+        stuck_penalty: float = 0.0,
+        stuck_steps: int = 600,
+        novelty_bonus: float = 0.01,
+        novelty_max_items: int = 200_000,
+        clamp_negative_progress: bool = False,
+        cell_bins: tuple[int, int] = (64, 64),
+        normalize_progress_by_frameskip: bool = True,
+        return_full_res: bool = False,
+        keep_screenshots: bool = True,
+        fixed_savestate_index: Optional[int] = None,
     ):
         super().__init__()
-        self.rank = int(rank)
-        self._min_y_pos = None
+        atexit.register(self.close)
 
+        self.rank = int(rank)
+
+        # ---- Resolve paths ----
+        if bizhawk_root is None:
+            bizhawk_root = os.environ.get("BIZHAWK_ROOT")
+
+        if bizhawk_root is None:
+            import sys
+
+            if sys.platform.startswith("win"):
+                bizhawk_root = r"C:\Users\simon\Documents\snes9x-1.60-win32-x64"
+            else:
+                bizhawk_root = os.path.abspath(
+                    os.path.join(os.path.dirname(__file__), "..", "BizHawk-2.11-linux-x64")
+                )
+        self.bizhawk_root = bizhawk_root
+
+        if rom_path is None:
+            rom_path = os.environ.get("BIZHAWK_ROM")
+
+        if rom_path is None:
+            import sys
+
+            if sys.platform.startswith("win"):
+                rom_path = os.path.join(self.bizhawk_root, "games", "Roms", "Super Mario World (U) [!].smc")
+            else:
+                rom_path = os.path.abspath(
+                    os.path.join(os.path.dirname(__file__), "..", "games", "Roms", "Super Mario World (U) [!].smc")
+                )
+        self.rom_path = rom_path
+
+        # ---- seeding ----
         if seed is None:
             seed = 12345 + self.rank
         self._seed = int(seed)
         random.seed(self._seed)
         np.random.seed(self._seed)
 
+        # ---- config ----
         self.headless = bool(headless)
         self._frameskip = int(frameskip)
         self._screenshot_every = int(screenshot_every)
         self._obs_size = int(obs_size)
+        self._sprite_slots = int(sprite_slots)
         self._verbose = int(verbose)
         self._reset_mode = str(reset_mode)
-
         self._ram_timeout_s = float(ram_timeout_s)
         self._reset_timeout_s = float(reset_timeout_s)
-        self._startup_sleep_s = float(startup_sleep_s)
 
-        self._progress_per_pixel = float(progress_per_pixel)
-        self._coin_reward = float(coin_reward)
+        self._exploration_bonus = float(exploration_bonus)
+        self._progress_scale = float(progress_scale)
         self._score_reward = float(score_reward)
         self._death_penalty = float(death_penalty)
         self._win_bonus = float(win_bonus)
         self._stuck_penalty = float(stuck_penalty)
+        self._stuck_steps = int(stuck_steps)
         self._normalize_progress_by_frameskip = bool(normalize_progress_by_frameskip)
+        self._return_full_res = bool(return_full_res)
+        self._keep_screenshots = bool(keep_screenshots)
+        self._fixed_savestate_index = None if fixed_savestate_index in (None, 0) else int(fixed_savestate_index)
 
-        self._exploration_bonus = float(exploration_bonus)
         self._novelty_enabled = bool(novelty_enabled)
+        self._novelty_bonus = float(novelty_bonus)
+        self._novelty_max_items = int(novelty_max_items)
+        self._clamp_negative_progress = bool(clamp_negative_progress)
         self._enable_cell_exploration = bool(enable_cell_exploration)
         self._cell_bonus_mode = str(cell_bonus_mode)
 
         self._stuck_max_steps = 3000
         self._stuck_counter = 0
-        self._consecutive_timeouts = 0 # Track timeouts for auto-restart
+        self._consecutive_timeouts = 0
+        self._restart_retry_interval_s = 60
 
-        # --- No progress timeout tracking ---
-        self._no_progress_timeout_s = 30.0  # 30 seconds in-game time
-        self._no_progress_start_x = None
-        self._no_progress_start_y = None
+        self._no_progress_timeout_s = 30.0
         self._no_progress_start_frame = None
-        self._no_progress_last_progress = False
-        self._no_progress_reset_pending = False
 
-        # Action space
-        self._action_type = action_type
+        # ---- spaces ----
+        self._action_type = str(action_type)
         if self._action_type == "discrete":
-            # Button order: Right, Left, Up, Down, Y (run), B (jump), A, X
-            # Always hold Y (run), never use Start, Select, L, R
-            # No more than 2 directions, no opposites
             directions = [
                 (1, 0, 0, 0),  # Right
                 (0, 1, 0, 0),  # Left
@@ -217,16 +346,14 @@ class MarioBizHawkEnv(gym.Env):
                 (0, 0, 0, 0),  # No direction
             ]
             actions = []
-            for dir in directions:
-                # Always hold Y (run)
-                base = list(dir) + [1, 0, 0, 0]
-                actions.append(tuple(base))  # No jump
-                # Add jump (B)
-                base_jump = list(dir) + [1, 1, 0, 0]
+            for d in directions:
+                base = list(d) + [1, 0, 0, 0]  # hold Y
+                actions.append(tuple(base))  # no jump
+                base_jump = list(d) + [1, 1, 0, 0]  # B jump
                 actions.append(tuple(base_jump))
             self._discrete_actions = actions
-            print(actions)
             self.action_space = gym.spaces.Discrete(len(self._discrete_actions))
+            assert len(self._discrete_actions) == 18
         elif self._action_type == "multibinary":
             self.action_space = gym.spaces.MultiBinary(8)
         elif self._action_type == "box":
@@ -235,143 +362,228 @@ class MarioBizHawkEnv(gym.Env):
             raise ValueError(f"Unknown action_type: {self._action_type}")
 
         self.observation_space = gym.spaces.Box(
-            low=0, high=255, shape=(self._obs_size, self._obs_size, 1), dtype=np.uint8
+            low=0, high=255, shape=(1, self._obs_size, self._obs_size), dtype=np.uint8
         )
 
-        # Paths
-        base_path = r"C:\Users\simon\Documents\snes9x-1.60-win32-x64\games\emulators\bizhawk\RAM\SNES"
+        # ---- IPC files ----
+        base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../games/emulators/bizhawk/RAM/SNES"))
         os.makedirs(base_path, exist_ok=True)
         self._ram_file = os.path.join(base_path, f"smw_ram_{self.rank}.txt")
         self._ctrl_file = os.path.join(base_path, f"smw_ctrl_{self.rank}.txt")
         self._screenshot_file = os.path.join(base_path, f"smw_screen_{self.rank}.bmp")
 
-        self._state_dir = state_dir or r"C:\Users\simon\Documents\snes9x-1.60-win32-x64\games\emulators\bizhawk\SNES\State"
-
-        self._exploration_dir = exploration_dir or os.path.join(
-            os.path.dirname(__file__), f"explore_{model_name}_rank{self.rank}"
+        default_state_dir = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "../games/emulators/bizhawk/SNES/State/")
         )
+        self._state_dir = state_dir or default_state_dir
+
+        self._exploration_dir = os.path.join(os.path.dirname(__file__), f"explore_{model_name}_rank{self.rank}")
         os.makedirs(self._exploration_dir, exist_ok=True)
-        self._explored_hashes = set()
-        # For cell exploration
-        self._cell_bins = (128, 64)
-        self._explored_cells = set()
-        self._explored_hashes = set()
-        self._cell_origin_x = None
-        self._cell_origin_y = None
 
-        # Ensure RAM file exists
-        if not os.path.exists(self._ram_file):
-            with open(self._ram_file, "w") as f:
-                f.write("0,0,0,0,0,0,0,0,0,0,0\n")
+        # exploration tracking
+        self._cell_bins = (int(cell_bins[0]), int(cell_bins[1]))
 
-        # Command id + initial ctrl
-        self._command_id = 0
-        # Use a valid default action for each action type
-        if self._action_type == "discrete":
-            default_action = 0
-        elif self._action_type == "multibinary":
-            default_action = [0] * 8
-        elif self._action_type == "box":
-            default_action = [0.0] * 8
-        else:
-            raise ValueError(f"Unknown action_type: {self._action_type}")
-        self._write_act(default_action, cmd_id=self._command_id)
-
-        # Observation cache
-        self._last_obs = np.zeros((self._obs_size, self._obs_size, 1), dtype=np.uint8)
+        # caches/trackers
+        self._last_obs = np.zeros((1, self._obs_size, self._obs_size), dtype=np.uint8)
         self._last_screenshot_mtime = 0.0
+        self._last_full_res = None
 
-        # Trackers
         self._last_score = None
-        self._last_coins = None
         self._last_lives = None
         self._last_level = None
         self._last_x_pos = None
+        self._last_y_pos = None
 
         self._last_emu_frame = -1
         self._frame_stuck_steps = 0
 
+        # cmd id
+        self._command_id = 0
+
+        # logs + proc
         self._bizhawk_proc = None
+        self._stdout_log = None
+        self._stderr_log = None
+
+        # Clean stale IPC/logs for this rank (helps after crashes)
+        for p in [
+            self._ram_file,
+            self._ctrl_file,
+            self._screenshot_file,
+            self._ram_file + ".lua_log",
+            self._ram_file + ".lua_err",
+        ]:
+            self._safe_unlink(p)
+
+        # Make sure files exist with sane initial content
+        # Use cmd_id=-1 so the Lua side ignores it and doesn't overwrite the handshake (-888).
+        zeros = ["0"] * (13 + self._sprite_slots * 3)
+        self._atomic_write_line(self._ram_file, ",".join(zeros) + "\n")
+        self._atomic_write_line(self._ctrl_file, "ACT,0,0,0,0,0,0,0,0,-1\n")
+
+        # Start emulator and wait for handshake
         self._start_bizhawk()
 
+        # Write initial ACT only AFTER handshake
+        if self._action_type == "discrete":
+            default_action = 0
+        elif self._action_type == "multibinary":
+            default_action = [0] * 8
+        else:
+            default_action = [0.0] * 8
+        self._write_act(default_action, cmd_id=self._command_id)
+
+        # Rewarder
         self.rewarder = RewardSMW(
-            progress_scale=0.01,
-            win_bonus=1000.0,
-            death_penalty=-50.0,
-            stuck_steps=600,
+            progress_scale=self._progress_scale,
+            win_bonus=self._win_bonus,
+            death_penalty=self._death_penalty,
+            stuck_steps=self._stuck_steps,
             stuck_penalty=self._stuck_penalty,
-            use_novelty=True,
-            novelty_bonus=0.01,
-            novelty_max_items=200_000,
-            clamp_negative_progress=True,
+            use_novelty=self._novelty_enabled,
+            novelty_bonus=self._novelty_bonus,
+            novelty_max_items=self._novelty_max_items,
+            clamp_negative_progress=self._clamp_negative_progress,
+            enable_cell_exploration=self._enable_cell_exploration,
+            cell_bonus_mode=self._cell_bonus_mode,
+            exploration_bonus=self._exploration_bonus,
+            cell_bins=self._cell_bins,
         )
 
-    # -------- IPC writers --------
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
-    # Disabled: do not auto-save progress savestates
-    def autosave_progress_state(self, x_pos: int, level: int | None = None) -> str:
-        return ""
+    # ---------------- process cleanup helpers ----------------
+    def _kill_rank_processes(self) -> None:
+        lua_name = f"smw_rl_control_{self.rank}.lua"
+        try:
+            out = subprocess.check_output(["bash", "-lc", f"pgrep -fa {shlex.quote(lua_name)} || true"], text=True)
+        except Exception:
+            return
 
-    def _write_ctrl_line(self, line: str):
-        for _ in range(50):
+        pids = []
+        for line in out.strip().splitlines():
+            parts = line.split()
+            if not parts:
+                continue
             try:
-                with open(self._ctrl_file, "w", newline="\n") as f:
-                    f.write(line)
-                    f.flush()
-                    os.fsync(f.fileno())
-                return
-            except PermissionError:
-                time.sleep(0.002)
-        # last try without fsync
-        with open(self._ctrl_file, "w", newline="\n") as f:
-            f.write(line)
+                pids.append(int(parts[0]))
+            except Exception:
+                continue
 
+        if not pids:
+            return
 
-    def _write_act(self, action, cmd_id=None):
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except Exception:
+                pass
+
+        time.sleep(0.3)
+
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+
+    # ---------------- IPC writers ----------------
+    def _write_act(self, action, cmd_id: Optional[int] = None) -> None:
         if cmd_id is None:
             cmd_id = self._command_id
+
         if self._action_type == "discrete":
-            button_vector = self._discrete_actions[action]
+            button_vector = self._discrete_actions[int(action)]
         elif self._action_type == "multibinary":
             button_vector = action
-        elif self._action_type == "box":
+        else:  # box
             button_vector = [1 if float(b) >= 0.5 else 0 for b in action]
-        else:
-            raise ValueError(f"Unknown action_type: {self._action_type}")
 
         row = ["ACT"] + [str(int(b)) for b in button_vector] + [str(int(cmd_id))]
-        self._write_ctrl_line(",".join(row) + "\n")
+        self._atomic_write_line(self._ctrl_file, ",".join(row) + "\n")
 
-    def _write_load(self, savestate_path, cmd_id=None):
+    def _write_load(self, savestate_path: str, cmd_id: Optional[int] = None) -> None:
         if cmd_id is None:
             cmd_id = self._command_id
         p = savestate_path.replace("\\", "/")
         row = ["LOAD", p, str(int(cmd_id))]
-        self._write_ctrl_line(",".join(row) + "\n")
+        self._atomic_write_line(self._ctrl_file, ",".join(row) + "\n")
 
-    def save_savestate(self, savestate_path, cmd_id=None):
-        if cmd_id is None:
-            cmd_id = self._command_id + 1
-            self._command_id = cmd_id
-        p = savestate_path.replace("\\", "/")
-        row = ["SAVE", p, str(int(cmd_id))]
-        self._write_ctrl_line(",".join(row) + "\n")
-        ack = self._wait_for_cmd_ack(cmd_id, timeout_s=self._reset_timeout_s)
-        if ack is None:
-            raise RuntimeError(f"Rank {self.rank}: SAVE timeout (cmd_id={cmd_id})")
-        return ack
+    def _read_ram_once(self):
+        if not os.path.exists(self._ram_file):
+            return None
+        try:
+            with open(self._ram_file, "r") as f:
+                line = f.readline()
+            if not line:
+                return None
+            parts = line.strip().split(",")
+            if len(parts) < 13:
+                return None
+            return [int(p) for p in parts]
+        except Exception:
+            return None
 
-    # -------- Lua script generation --------
-    def _create_lua_script(self):
-        lua_dir = r"C:\Users\simon\Documents\snes9x-1.60-win32-x64\games\emulators\bizhawk\Lua\SNES"
+    def _parse_sprite_slots(self, ram_data):
+        tail = ram_data[13:]
+        needed = self._sprite_slots * 3
+        if len(tail) < needed:
+            tail = tail + [0] * (needed - len(tail))
+        alive = np.zeros((self._sprite_slots,), dtype=np.float32)
+        xy = np.zeros((self._sprite_slots, 2), dtype=np.float32)
+        for i in range(self._sprite_slots):
+            base = i * 3
+            alive[i] = float(tail[base])
+            xy[i, 0] = float(tail[base + 1])
+            xy[i, 1] = float(tail[base + 2])
+        return alive, xy
+
+    def _wait_for_cmd_ack(self, cmd_id: int, timeout_s: float):
+        deadline = time.time() + float(timeout_s)
+        while time.time() < deadline:
+            last = self._read_ram_once()
+            if last is not None and int(last[-1]) == int(cmd_id):
+                return last
+            time.sleep(0.002)
+        return None
+
+    # ---------------- Lua script ----------------
+    def _create_lua_script(self) -> str:
+        lua_dir = os.path.join(self.bizhawk_root, "Lua", "SNES")
         os.makedirs(lua_dir, exist_ok=True)
         target_lua = os.path.join(lua_dir, f"smw_rl_control_{self.rank}.lua")
 
         lua_ram = self._ram_file.replace("\\", "/")
         lua_ctrl = self._ctrl_file.replace("\\", "/")
         lua_screenshot = self._screenshot_file.replace("\\", "/")
+        lua_log = (self._ram_file + ".lua_log").replace("\\", "/")
 
         lua_content = f'''\
+local function log(msg)
+    local f = io.open("{lua_log}", "a")
+    if f then
+        f:write("LUA DEBUG: " .. tostring(msg) .. "\\n")
+        f:close()
+    end
+    io.stdout:write("LUA DEBUG: " .. tostring(msg) .. "\\n")
+    io.stdout:flush()
+end
+
+local function read_u16_le(addr)
+    if memory.read_u16_le then
+        return memory.read_u16_le(addr)
+    else
+        local lo = memory.read_u8(addr)
+        local hi = memory.read_u8(addr + 1)
+        return lo + 256 * hi
+    end
+end
+
+log("--- Mario RL Lua Script Starting (Rank {self.rank}) ---")
 local ctrl_file = "{lua_ctrl}"
 local ram_file = "{lua_ram}"
 local screenshot_file = "{lua_screenshot}"
@@ -379,7 +591,7 @@ local screenshot_file = "{lua_screenshot}"
 local frames_to_advance = {int(self._frameskip)}
 local screenshot_every = {int(self._screenshot_every)}
 local last_processed_id = -1
-
+local slots = {int(self._sprite_slots)}
 local buttons_map = {{
   "P1 Right", "P1 Left", "P1 Up", "P1 Down",
   "P1 Y", "P1 B", "P1 A", "P1 X"
@@ -389,25 +601,49 @@ local heartbeat_every = 60
 local last_heartbeat = 0
 
 function write_ram(cmd_id)
-    local score = memory.read_u16_le(0x0F34)
+    local score = read_u16_le(0x0F34)
     local coins = memory.read_u8(0x0DBF)
     local lives = memory.read_u8(0x0DBE)
     local level = memory.read_u8(0x13BF)
-    local x_pos = memory.read_u16_le(0x0094)
-    local y_pos = memory.read_u16_le(0x0096)
+    local x_pos = read_u16_le(0x0094)
+    local y_pos = read_u16_le(0x0096)
     local state = memory.read_u8(0x0071)
     local timer = memory.read_u8(0x0F31)*100 + memory.read_u8(0x0F32)*10 + memory.read_u8(0x0F33)
     local game_mode = memory.read_u8(0x0100)
     local frame = emu.framecount()
 
-    local line = string.format("%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\\n",
-        score, coins, lives, level, x_pos, y_pos, state, timer, game_mode, frame, cmd_id)
+    local layer1_x = read_u16_le(0x001A)
+    local layer1_y = read_u16_le(0x001C)
+
+    local sprite_parts = {{}}
+    for i = 0, slots - 1 do
+        local status = memory.read_u8(0x14C8 + i)
+        local alive = (status ~= 0) and 1 or 0
+        local x = memory.read_u8(0x00E4 + i) + 256 * memory.read_u8(0x14E0 + i)
+        local y = memory.read_u8(0x00D8 + i) + 256 * memory.read_u8(0x14D4 + i)
+        local sx = x - layer1_x
+        local sy = y - layer1_y
+        table.insert(sprite_parts, tostring(alive))
+        table.insert(sprite_parts, tostring(sx))
+        table.insert(sprite_parts, tostring(sy))
+    end
+    local head = string.format("%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
+        score, coins, lives, level, x_pos, y_pos, layer1_x, layer1_y, state, timer, game_mode, frame, cmd_id)
+    local sprite_str = table.concat(sprite_parts, ",")
+    local line
+    if sprite_str ~= "" then
+        line = head .. "," .. sprite_str .. "," .. tostring(cmd_id) .. "\\n"
+    else
+        line = head .. "," .. tostring(cmd_id) .. "\\n"
+    end
 
     local f = io.open(ram_file, "w")
     if f then
         f:write(line)
         f:flush()
         f:close()
+    else
+        log("ERROR: Could not open ram_file for writing: " .. ram_file)
     end
 end
 
@@ -444,7 +680,10 @@ local function process_command()
 
   if cmd_type == "LOAD" then
     local p = parts[2]
-    if p and p ~= "" then savestate.load(p) end
+    if p and p ~= "" then
+        local ok, err = pcall(function() savestate.load(p) end)
+        if not ok then log("LOAD ERROR: " .. tostring(err)) end
+    end
     emu.frameadvance()
     maybe_screenshot(cmd_id, true)
     write_ram(cmd_id)
@@ -453,7 +692,10 @@ local function process_command()
 
   if cmd_type == "SAVE" then
     local p = parts[2]
-    if p and p ~= "" then savestate.save(p) end
+    if p and p ~= "" then
+        local ok, err = pcall(function() savestate.save(p) end)
+        if not ok then log("SAVE ERROR: " .. tostring(err)) end
+    end
     emu.frameadvance()
     maybe_screenshot(cmd_id, true)
     write_ram(cmd_id)
@@ -466,7 +708,6 @@ local function process_command()
       local bit = parts[i+1]
       btns[buttons_map[i]] = (bit == "1")
     end
-
     if btns["P1 Left"] and btns["P1 Right"] then btns["P1 Left"] = false end
     if btns["P1 Up"] and btns["P1 Down"] then btns["P1 Up"] = false end
 
@@ -474,7 +715,6 @@ local function process_command()
       joypad.set(btns)
       emu.frameadvance()
     end
-
     maybe_screenshot(cmd_id, false)
     write_ram(cmd_id)
     return true
@@ -484,87 +724,208 @@ local function process_command()
   return true
 end
 
-while true do
-  local did = process_command()
-  if not did then
-    local fr = emu.framecount()
-    if fr - last_heartbeat >= heartbeat_every then
-      last_heartbeat = fr
-      write_ram(last_processed_id)
+local function main_loop()
+    local f = io.open(ram_file, "w")
+    if f then
+        local zeros = {{}}
+        for i = 1, slots * 3 do
+            table.insert(zeros, "0")
+        end
+        local head = "0,0,0,0,0,0,0,0,0,0,0,0,-888"
+        local line = head .. "," .. table.concat(zeros, ",") .. ",-888\\n"
+        f:write(line)
+        f:flush()
+        f:close()
     end
-    emu.yield()
-  end
+
+    while true do
+      local did = process_command()
+      if not did then
+        local fr = emu.framecount()
+        if fr - last_heartbeat >= heartbeat_every then
+          last_heartbeat = fr
+          write_ram(last_processed_id)
+        end
+        emu.yield()
+      end
+    end
+end
+
+local ok, err = pcall(main_loop)
+if not ok then
+    local err_file = ram_file .. ".lua_err"
+    local f = io.open(err_file, "w")
+    if f then
+        f:write(tostring(err) .. "\\n")
+        f:close()
+    end
+    log("CRITICAL LUA ERROR: " .. tostring(err))
 end
 '''
         with open(target_lua, "w", newline="\n") as f:
             f.write(lua_content)
         return target_lua
 
-    # -------- BizHawk start/stop --------
-    def _start_bizhawk(self):
-        bizhawk_path = r"C:\Users\simon\Documents\snes9x-1.60-win32-x64\games\emulators\bizhawk\EmuHawk.exe"
-        rom_path = r"C:\Users\simon\Documents\snes9x-1.60-win32-x64\games\Roms\Super Mario World (U) [!].smc"
+    # ---------------- process management ----------------
+    def _start_bizhawk(self) -> None:
+        import sys
 
+        is_windows = sys.platform.startswith("win")
+        is_linux = sys.platform.startswith("linux")
+
+        if is_windows:
+            bizhawk_path = os.path.join(self.bizhawk_root, "games", "emulators", "bizhawk", "EmuHawk.exe")
+            lua_script = self._create_lua_script()
+            cmd = [bizhawk_path, "--audiosync", "false", "--gdi", "--chromeless", "--lua", lua_script, self.rom_path]
+            startupinfo = None
+            if self.headless:
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            if self._verbose:
+                print(f"--- [Rank {self.rank}] Starting BizHawk [Windows] ---")
+            self._bizhawk_proc = subprocess.Popen(cmd, startupinfo=startupinfo)
+            return
+
+        if not is_linux:
+            raise RuntimeError("Unsupported OS for BizHawk launch.")
+
+        # Kill any previous same-rank processes
+        self._kill_rank_processes()
+
+        # Nuke config that can pop modal
+        cfg = os.path.join(self.bizhawk_root, "config.ini")
+        try:
+            if os.path.exists(cfg):
+                os.replace(cfg, cfg + ".bak")
+        except Exception:
+            pass
+
+        emu_hawk_exe = os.path.join(self.bizhawk_root, "EmuHawk.exe")
         lua_script = self._create_lua_script()
 
-        if self._verbose >= 1:
-            print(f"--- [Rank {self.rank}] Starting BizHawk (frameskip={self._frameskip}) ---")
+        if not os.path.isfile(lua_script):
+            raise FileNotFoundError(f"Lua script not found: {lua_script}")
+        if not os.path.isfile(emu_hawk_exe):
+            raise FileNotFoundError(f"EmuHawk.exe not found: {emu_hawk_exe}")
+        if not os.path.isfile(self.rom_path):
+            raise FileNotFoundError(f"ROM file not found: {self.rom_path}")
 
-        cmd = [bizhawk_path, rom_path, "--lua", lua_script]
+        env = os.environ.copy()
+        libpath = "/usr/lib/x86_64-linux-gnu"
+        env["LD_LIBRARY_PATH"] = f"{self.bizhawk_root}/dll:{self.bizhawk_root}:{libpath}:{env.get('LD_LIBRARY_PATH','')}"
+        env["MONO_CRASH_NOFILE"] = "1"
+        env["MONO_WINFORMS_XIM_STYLE"] = "disabled"
+        env["ALSOFT_DRIVERS"] = "pulse"
+        env["PULSE_SINK"] = "DummySink"
 
-        startupinfo = None
-        if self.headless:
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        # logs
+        log_dir = os.path.join(os.path.dirname(self._ram_file), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        self._stdout_log = open(os.path.join(log_dir, f"bizhawk_{self.rank}.stdout.log"), "w")
+        self._stderr_log = open(os.path.join(log_dir, f"bizhawk_{self.rank}.stderr.log"), "w")
 
-        self._bizhawk_proc = subprocess.Popen(cmd, startupinfo=startupinfo)
-        time.sleep(self._startup_sleep_s)
+        # Minimal launch command (no xdotool modal handling loop)
+        inner_cmd = (
+            f"mono {shlex.quote(emu_hawk_exe)} --audiosync false --gdi --chromeless "
+            f"--lua {shlex.quote(lua_script)} {shlex.quote(self.rom_path)}"
+        )
 
-    def close(self):
-        if getattr(self, "_bizhawk_proc", None) is not None:
+        cmd = ["xvfb-run", "-a", "-s", "-screen 0 1280x720x24 -nolisten tcp", "bash", "-lc", inner_cmd]
+
+        if self._verbose:
+            print(f"--- [Rank {self.rank}] Starting BizHawk [Linux] ---")
+            print(f"    CWD: {self.bizhawk_root}")
+            print(f"    CMD: {shlex.join(cmd)}")
+
+        self._bizhawk_proc = subprocess.Popen(
+            cmd,
+            stdout=self._stdout_log,
+            stderr=self._stderr_log,
+            cwd=self.bizhawk_root,
+            env=env,
+            preexec_fn=os.setsid,
+        )
+
+        # Wait for handshake (-888)
+        if self._verbose:
+            print(f"--- [Rank {self.rank}] Waiting for Lua handshake (-888)... ---")
+
+        deadline = time.time() + self._reset_timeout_s
+        while time.time() < deadline:
+            if self._bizhawk_proc.poll() is not None:
+                break
+            ram = self._read_ram_once()
+            if ram is not None and ram[-1] == -888:
+                if self._verbose:
+                    print(f"--- [Rank {self.rank}] Lua ready! ---")
+                return
+            time.sleep(0.2)
+
+        # On failure, check lua_err
+        err_msg = ""
+        err_file = self._ram_file + ".lua_err"
+        if os.path.exists(err_file):
             try:
-                self._bizhawk_proc.terminate()
-                self._bizhawk_proc.wait(timeout=2)
+                with open(err_file, "r") as f:
+                    err_msg = f.read().strip()
+            except Exception:
+                err_msg = ""
+
+        self.close()
+        raise RuntimeError(
+            f"Rank {self.rank}: Lua handshake timeout after {self._reset_timeout_s}s."
+            f"{(' Lua err: ' + err_msg) if err_msg else ''}  "
+            f"Check logs in: {log_dir}"
+        )
+
+    def close(self) -> None:
+        proc = getattr(self, "_bizhawk_proc", None)
+        if proc is not None:
+            try:
+                pgid = os.getpgid(proc.pid)
+            except Exception:
+                pgid = None
+
+            # graceful
+            try:
+                if pgid is not None:
+                    os.killpg(pgid, signal.SIGTERM)
+                else:
+                    proc.terminate()
             except Exception:
                 pass
+
+            # wait then hard kill
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                try:
+                    if pgid is not None:
+                        os.killpg(pgid, signal.SIGKILL)
+                    else:
+                        proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=10)
+                except Exception:
+                    pass
+
             self._bizhawk_proc = None
 
-    # -------- Helpers --------
-    def _read_ram_once(self):
-        if not os.path.exists(self._ram_file):
-            return None
-        try:
-            with open(self._ram_file, "r") as f:
-                line = f.readline()
-            if not line:
-                return None
-            parts = line.strip().split(",")
-            if len(parts) < 11:
-                return None
-            return [int(parts[i]) for i in range(11)]
-        except Exception:
-            return None
+        for attr in ("_stdout_log", "_stderr_log"):
+            f = getattr(self, attr, None)
+            if f:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+                try:
+                    delattr(self, attr)
+                except Exception:
+                    pass
 
-    def _wait_for_cmd_ack(self, cmd_id, timeout_s):
-        deadline = time.time() + float(timeout_s)
-        last = None
-        start_mtime = os.path.getmtime(self._ram_file) if os.path.exists(self._ram_file) else 0.0
-
-        while time.time() < deadline:
-            last = self._read_ram_once()
-            if last is not None and int(last[-1]) == int(cmd_id):
-                return last
-
-            # If RAM file never changes, we are not getting any new data
-            if os.path.exists(self._ram_file):
-                mtime = os.path.getmtime(self._ram_file)
-                if mtime > start_mtime:
-                    start_mtime = mtime  # it is changing, keep waiting
-
-            time.sleep(0.002)
-
-        return None
-
+    # ---------------- observation ----------------
     def _get_obs(self):
         if not os.path.exists(self._screenshot_file):
             return self._last_obs
@@ -572,24 +933,29 @@ end
             mtime = os.path.getmtime(self._screenshot_file)
             if mtime == self._last_screenshot_mtime:
                 return self._last_obs
-            img = cv2.imread(self._screenshot_file, 0)
-            if img is None:
+            full_res = cv2.imread(self._screenshot_file, cv2.IMREAD_COLOR)
+            if full_res is None:
                 return self._last_obs
-            if img.shape[0] != self._obs_size or img.shape[1] != self._obs_size:
-                img = cv2.resize(img, (self._obs_size, self._obs_size), interpolation=cv2.INTER_NEAREST)
-            self._last_obs = img.reshape((self._obs_size, self._obs_size, 1))
+            self._last_full_res = full_res
+            gray = cv2.cvtColor(full_res, cv2.COLOR_BGR2GRAY)
+            if gray.shape[0] != self._obs_size or gray.shape[1] != self._obs_size:
+                gray = cv2.resize(gray, (self._obs_size, self._obs_size), interpolation=cv2.INTER_NEAREST)
+            self._last_obs = gray.reshape((1, self._obs_size, self._obs_size))
             self._last_screenshot_mtime = mtime
+            if not self._keep_screenshots:
+                self._safe_unlink(self._screenshot_file)
             return self._last_obs
         except Exception:
             return self._last_obs
 
+    # ---------------- savestates ----------------
     def _list_savestates(self):
         if not os.path.isdir(self._state_dir):
             return []
         states = []
         for f in os.listdir(self._state_dir):
             if f.endswith(".State") and "SMW" in f:
-                states.append(os.path.join(self._state_dir, f))
+                states.append(os.path.abspath(os.path.join(self._state_dir, f)))
         return sorted(states)
 
     def get_savestate_by_index(self, idx: int):
@@ -602,7 +968,7 @@ end
             raise ValueError(f"Level index {idx} out of range (1-{len(states)})")
         return states[idx - 1]
 
-    # -------- Gym API --------
+    # ---------------- Gym API ----------------
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
 
@@ -610,19 +976,19 @@ end
             self.close()
             self._start_bizhawk()
 
-        # ✅ Reset episode-level exploration memory on every reset
-        self._explored_cells = set()
-        self._explored_hashes = set()
+        # per-episode exploration reset
         self._stuck_counter = 0
-        self._min_y_pos = None
-        self._cell_origin_x = None
-        self._cell_origin_y = None
 
         states = self._list_savestates()
         if not states:
             raise RuntimeError(f"No savestates found in {self._state_dir}")
 
-        chosen = options.get("savestate") if options and options.get("savestate") else random.choice(states)
+        if options and options.get("savestate"):
+            chosen = options["savestate"]
+        elif self._fixed_savestate_index is not None:
+            chosen = self.get_savestate_by_index(self._fixed_savestate_index)
+        else:
+            chosen = random.choice(states)
 
         self._command_id += 1
         self._write_load(chosen, cmd_id=self._command_id)
@@ -631,29 +997,36 @@ end
         if ram_data is None:
             raise RuntimeError(f"Rank {self.rank}: reset LOAD timeout (cmd_id={self._command_id})")
 
-        score, coins, lives, level, x_pos, y_pos, state, timer, game_mode, frame, cmd_id = ram_data
+        score, coins, lives, level, x_pos, y_pos, layer1_x, layer1_y, state, timer, game_mode, frame, cmd_id = ram_data[:13]
+        sprite_alive, sprite_xy = self._parse_sprite_slots(ram_data)
 
         self._last_score = score
-        self._last_coins = coins
         self._last_lives = lives
         self._last_level = level
         self._last_x_pos = x_pos
         self._last_y_pos = y_pos
         self._last_emu_frame = frame
         self._frame_stuck_steps = 0
-        self._stuck_counter = 0
+        self._no_progress_start_frame = frame
 
         self.rewarder.reset()
 
-        # Track for no-progress timeout
-        self._no_progress_start_x = x_pos
-        self._no_progress_start_y = y_pos
-        self._no_progress_start_frame = frame
-        self._no_progress_last_progress = False
-        self._no_progress_reset_pending = False
-
         obs = self._get_obs()
-        info = {"savestate": chosen, "level": level, "x_pos": x_pos, "y_pos": y_pos, "cmd_id": cmd_id}
+        info = {
+            "savestate": chosen,
+            "level": level,
+            "x_pos": x_pos,
+            "y_pos": y_pos,
+            "layer1_x": layer1_x,
+            "layer1_y": layer1_y,
+            "mario_screen_x": x_pos - layer1_x,
+            "mario_screen_y": y_pos - layer1_y,
+            "cmd_id": cmd_id,
+            "sprite_alive": sprite_alive,
+            "sprite_xy": sprite_xy,
+        }
+        if self._return_full_res:
+            info["full_res_frame"] = self._last_full_res
         return obs, info
 
     def step(self, action):
@@ -663,25 +1036,36 @@ end
         ram_data = self._wait_for_cmd_ack(self._command_id, timeout_s=self._ram_timeout_s)
         if ram_data is None:
             self._consecutive_timeouts += 1
-            if self._verbose >= 1:
-                print(f"[Rank {self.rank}] RAM timeout at cmd_id={self._command_id} ({self._consecutive_timeouts}/3).")
-            
-            # If we hit 3 timeouts in a row, the emulator is likely dead - restart it
-            if self._consecutive_timeouts >= 3:
-                print(f"[Rank {self.rank}] Too many timeouts; restarting BizHawk.")
-                self.close()
-                self._start_bizhawk()
-                self._consecutive_timeouts = 0
-            
-            obs = self._get_obs()
-            return obs, 0.0, False, False, {"error": "ram_timeout"}
+            if self._verbose:
+                print(
+                    f"[Rank {self.rank}] RAM timeout at cmd_id={self._command_id} "
+                    f"({self._consecutive_timeouts} in a row)"
+                )
 
-        self._consecutive_timeouts = 0 # Reset on success
+            if self._verbose:
+                print(
+                    f"[Rank {self.rank}] Restarting BizHawk after timeout; "
+                    f"retrying every {self._restart_retry_interval_s}s until it comes back."
+                )
+            self._restart_bizhawk_with_retry(reason="ram_timeout")
+            self._consecutive_timeouts = 0
+
+            obs = self._get_obs()
+            return obs, 0.0, False, False, {"error": "ram_timeout", "restarted": True}
+
+        self._consecutive_timeouts = 0
 
         obs = self._get_obs()
-        score, coins, lives, level, x_pos, y_pos, state, timer, game_mode, frame, cmd_id = ram_data
+        score, coins, lives, level, x_pos, y_pos, layer1_x, layer1_y, state, timer, game_mode, frame, cmd_id = ram_data[:13]
+        sprite_alive, sprite_xy = self._parse_sprite_slots(ram_data)
 
-        # Frame stuck detection
+        if self._verbose >= 2:
+            active = np.where(sprite_alive > 0.5)[0].tolist()
+            if active:
+                coords = [(int(i), float(sprite_xy[i, 0]), float(sprite_xy[i, 1])) for i in active]
+                print(f"[Rank {self.rank}] Sprites: {coords}")
+
+        # frame stuck detection
         if frame == self._last_emu_frame:
             self._frame_stuck_steps += 1
         else:
@@ -689,108 +1073,26 @@ end
             self._last_emu_frame = frame
 
         if self._frame_stuck_steps > (self._frameskip * 5):
-            if self._verbose >= 1:
-                print(f"[Rank {self.rank}] frame stuck; restarting BizHawk.")
-            self.close()
-            self._start_bizhawk()
+            if self._verbose:
+                print(f"[Rank {self.rank}] frame stuck, restarting BizHawk")
+            self._restart_bizhawk_with_retry(reason="frame_stuck")
             obs = self._get_obs()
-            return obs, 0.0, False, False, {"error": "frame_stuck_restart"}
+            return obs, 0.0, False, False, {"error": "frame_stuck_restart", "restarted": True}
 
-        # --- No progress timeout logic ---
-        # If no progress (x or y change) for 30 seconds, reset.
-        no_progress = False
+        # no progress timeout
+        if self._no_progress_start_frame is None:
+            self._no_progress_start_frame = frame
         if self._last_x_pos is not None and self._last_y_pos is not None:
             if x_pos != self._last_x_pos or y_pos != self._last_y_pos:
-                # Mario moved, reset the timer
                 self._no_progress_start_frame = frame
-            
-            elapsed_frames = frame - self._no_progress_start_frame
-            if elapsed_frames >= int(self._no_progress_timeout_s * 60):
-                no_progress = True
 
-        if no_progress:
-            if self._verbose >= 1:
-                print(f"[Rank {self.rank}] No progress for 30 seconds; resetting.")
-            # Reset tracking for next episode
-            self._no_progress_start_frame = frame 
+        elapsed_frames = frame - self._no_progress_start_frame
+        if elapsed_frames >= int(self._no_progress_timeout_s * 60):
+            if self._verbose:
+                print(f"[Rank {self.rank}] No progress for {self._no_progress_timeout_s}s, truncating")
             return obs, 0.0, False, True, {"error": "no_progress_timeout"}
 
-        ram_dict = {
-            "score": score,
-            "coins": coins,
-            "lives": lives,
-            "level": level,
-            "x_pos": x_pos,
-            "y_pos": y_pos,
-            "state": state,
-            "timer": timer,
-            "game_mode": game_mode,
-            "frame": frame,
-        }
-
-        info_flags = {
-            "win": (self._last_level is not None and level > self._last_level),
-            "death": (
-                (self._last_lives is not None and lives < self._last_lives)
-                or timer <= 0
-                or state == 9
-                or game_mode == 0x0E
-            ),
-        }
-
-        # Reward is based on score delta
-        reward = 0.0
-        if self._last_score is not None:
-            score_delta = score - self._last_score
-            reward += score_delta * self._score_reward
-        # reward = self.rewarder.step_reward(obs, ram_dict, terminated=False, truncated=False, info=info_flags)
-        # Cell-based exploration bonus (discretize x/y into bins)
-        if self._enable_cell_exploration:
-            # On first frame, store Mario's initial position as origin
-            if self._cell_origin_x is None or self._cell_origin_y is None:
-                self._cell_origin_x = x_pos
-                self._cell_origin_y = y_pos
-            # if y_pos - self._cell_origin_y < 0:
-            #     self._cell_origin_y = y_pos  # Adjust origin if going upwards
-            rel_x = abs(x_pos - self._cell_origin_x)
-            rel_y = abs(y_pos - self._cell_origin_y)
-            bin_x = int(rel_x // self._cell_bins[0])
-            bin_y = int(rel_y // self._cell_bins[1])
-            cell = (bin_x, bin_y)
-            # Print when new minimum y_pos is reached (i.e., Mario jumps higher)
-            if self._min_y_pos is None or y_pos < self._min_y_pos:
-                self._min_y_pos = y_pos
-                # print(f"[Rank {self.rank}] New min y_pos: {y_pos}")
-            new_cell = cell not in self._explored_cells
-            if new_cell:
-                self._explored_cells.add(cell)
-                if self._cell_bonus_mode == "linear":
-                    # Linear distance from origin (0,0)
-                    dist = ((bin_x ** 2 + bin_y ** 2) ** 0.5)
-                    reward += dist * self._exploration_bonus
-                elif self._cell_bonus_mode == "constant":
-                    reward += self._exploration_bonus
-                elif self._cell_bonus_mode == "quadratic":
-                    dist = ((bin_x ** 2 + bin_y ** 2) ** 2)
-                    reward += dist * self._exploration_bonus
-                else:
-                    dist = (bin_x ** 2 + bin_y ** 2)
-                    reward += dist * self._exploration_bonus
-                if self._verbose >= 2:
-                    print(f"[Rank {self.rank}] New cell explored: {cell}, total cells: {len(self._explored_cells)}")
-            # No bonus for revisiting cells
-        elif self._novelty_enabled:
-            # Cheap novelty bonus (legacy)
-            obs_hash = hashlib.blake2b(obs.tobytes(), digest_size=8).hexdigest()
-            if obs_hash not in self._explored_hashes:
-                self._explored_hashes.add(obs_hash)
-                reward += self._exploration_bonus
-                self._stuck_counter = 0
-            else:
-                self._stuck_counter += 1
-
-        if reward > 0:
-            pass
+        # termination logic
         died = False
         won = False
         timeout_death = False
@@ -805,33 +1107,67 @@ end
         if self._last_level is not None and level > self._last_level:
             won = True
 
-        terminated = False
+        terminated = died or won
         truncated = False
-        if died:
-            terminated = True
-            reward += self._death_penalty if not timeout_death else self._death_penalty
-        elif won:
-            terminated = True
-            reward += self._win_bonus
-        elif self._stuck_counter >= self._stuck_max_steps:
+        if self._stuck_counter >= self._stuck_max_steps:
             truncated = True
-            self._stuck_counter = 0
-            reward += self._death_penalty
-            if self._verbose >= 1:
-                print(f"[Rank {self.rank}] Episode truncated due to stuck detection.")
+            if self._verbose:
+                print(f"[Rank {self.rank}] Truncated (stuck)")
 
+        # Calculate Reward via RewardSMW
+        # Calculate Reward via RewardSMW
+        # 1. Base rewards (Progress, Novelty, Win/Loss, Stuck) + Cell Exploration
+        ram_dict = {"x_pos": x_pos, "y_pos": y_pos}
+        reward, reward_info = self.rewarder.step_reward(
+            obs_img=obs,
+            ram=ram_dict,
+            terminated=terminated,
+            truncated=truncated,
+            info={"win": won, "death": died}
+        )
+
+        # Env-level stuck counter for truncation
+        # Use RewardSMW info to determine if we are "stuck" relative to its metrics
+        # If RewardSMW says we made progress or found novelty, reset counter.
+        # Also check local progress (x_pos > last_x_pos) as a looser stuck check?
+        # User requested to remove redundancy.
+        # Let's rely on what RewardSMW considers "new" + local progress check for loose movement.
+        
+        found_something = reward_info.get("new_progress", False) or reward_info.get("new_novelty", False) or reward_info.get("new_cell", False)
+        
+        # Keep local progress check for truncation safety? 
+        # If agent is moving forward (even if not max progress), we probably shouldn't truncate.
+        if x_pos > (self._last_x_pos if self._last_x_pos is not None else -99999):
+             found_something = True
+
+        if found_something:
+            self._stuck_counter = 0
+        else:
+            self._stuck_counter += 1
+
+        # Env-level stuck counter for truncation (RewardSMW has its own penalty logic but doesn't truncate)
+        # We need to manually update stuck counter for truncation purposes if we are relying on novelty/progress
+        # Wait, RewardSMW tracks `steps_since_progress`. We can query it?
+        # Or just keep the existing `stuck_counter` logic relative to Novelty/Exploration?
+        
+        # Original logic: 
+        # if novelty/cell found: stuck_counter = 0
+        # else: stuck_counter += 1
+        
+        # RewardSMW doesn't expose "did I find novelty?".
+        # BUT we can check if reward > 0? No, progress gives reward too.
+        # Let's keep `self._stuck_counter` logic for TRUNCATION separate from RewardSMW's penalty.
+        # Although this is slightly redundant.
+
+        # update trackers
         self._last_score = score
-        self._last_coins = coins
         self._last_lives = lives
         self._last_level = level
         self._last_x_pos = x_pos
-        # Reset explored cells on episode end
-        if terminated or truncated:
-            self._explored_cells = set()
-            self._explored_hashes = set()
+        self._last_y_pos = y_pos
 
-        # Auto-save savestate logic disabled
-        # self.maybe_auto_save_savestate(x_pos)
+        if terminated or truncated:
+            self.rewarder.reset() # RewardSMW has its own seen_hashes and cell exploration
 
         info = {
             "score": score,
@@ -840,37 +1176,139 @@ end
             "level": level,
             "x_pos": x_pos,
             "y_pos": y_pos,
+            "layer1_x": layer1_x,
+            "layer1_y": layer1_y,
+            "mario_screen_x": x_pos - layer1_x,
+            "mario_screen_y": y_pos - layer1_y,
             "timer": timer,
             "state": state,
             "game_mode": game_mode,
             "frame": frame,
             "cmd_id": cmd_id,
+            "win": won,
+            "death": died,
+            "timeout_death": timeout_death,
+            "sprite_alive": sprite_alive,
+            "sprite_xy": sprite_xy,
+            "reward_progress": reward_info.get("reward_progress", 0.0),
+            "reward_novelty": reward_info.get("reward_novelty", 0.0),
+            "reward_cell": reward_info.get("reward_cell", 0.0),
+            "reward_win": reward_info.get("reward_win", 0.0),
+            "reward_death": reward_info.get("reward_death", 0.0),
+            "reward_stuck": reward_info.get("reward_stuck", 0.0),
         }
-        info["win"] = won
-        info["death"] = died
+        if self._return_full_res:
+            info["full_res_frame"] = self._last_full_res
         return obs, float(reward), bool(terminated), bool(truncated), info
 
+    def _restart_bizhawk_with_retry(self, reason: str) -> None:
+        while True:
+            try:
+                self.close()
+                self._start_bizhawk()
+                return
+            except Exception as exc:
+                if self._verbose:
+                    print(
+                        f"[Rank {self.rank}] BizHawk restart failed ({reason}): {exc}. "
+                        f"Retrying in {self._restart_retry_interval_s}s..."
+                    )
+                time.sleep(self._restart_retry_interval_s)
 
+
+# ---------------- Standalone runner ----------------
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--level", type=int, default=0)
+    parser.add_argument("--bizhawk_root", type=str, default="/home/simon/snesRL/BizHawk-2.11-linux-x64")
+    parser.add_argument("--rom_path", type=str, default=None)
+    parser.add_argument("--headless", type=int, default=1)
+    parser.add_argument("--verbose", type=int, default=1)
+    parser.add_argument("--screenshot_every", type=int, default=30)
     args = parser.parse_args()
 
-    # Determine use_novelty value
-    if args.use_novelty is not None:
-        use_novelty = True
-    elif args.no_use_novelty:
-        use_novelty = False
-    else:
-        use_novelty = True
+    env = MarioBizHawkEnv(
+        bizhawk_root=args.bizhawk_root,
+        rom_path=args.rom_path,
+        headless=bool(args.headless),
+        verbose=int(args.verbose),
+        rank=0,
+        screenshot_every=int(args.screenshot_every),
+    )
 
-    env = MarioBizHawkEnv()
-    env.rewarder.use_novelty = use_novelty
+    def _cleanup(*_):
+        try:
+            env.close()
+        except Exception:
+            pass
+
+    atexit.register(_cleanup)
+
+    def _sig_handler(signum, frame):
+        _cleanup()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGINT, _sig_handler)
+    signal.signal(signal.SIGTERM, _sig_handler)
+
     if args.level == 0:
         obs, info = env.reset()
     else:
         savestate = env.get_savestate_by_index(args.level)
         obs, info = env.reset(options={"savestate": savestate})
-    print(f"Loaded level: {info['level']}, savestate: {info['savestate']}, use_novelty: {env.rewarder.use_novelty}")
+
+    print(f"Loaded level: {info['level']}, savestate: {info['savestate']}")
+
+    """
+        # Construct the internal bash command to run inside xvfb-run
+        # 1. Start PulseAudio with a null sink (Restored for robustness)
+        # 2. Launch BizHawk
+        # 3. Targeted background loop to dismiss modals if they appear
+        # inner_cmd = (
+        #     "pulseaudio --start --exit-idle-time=-1; "
+        #     "pactl load-module module-null-sink sink_name=DummySink sink_properties=device.description=DummySink >/dev/null 2>&1 || true; "
+        #     "export PULSE_SINK=DummySink; "
+        #     f"mono {shlex.quote(emu_hawk_exe)} --audiosync false --gdi --chromeless --lua {shlex.quote(lua_script)} {shlex.quote(self.rom_path)} & "
+        #     "BIZ_PID=$!; "
+        #     "if ! command -v xdotool >/dev/null 2>&1; then echo \"[Rank %s] xdotool not found, cannot dismiss dialogs\" >&2; fi; " % self.rank +
+        #     "for i in {1..60}; do "
+        #     "  sleep 1; "
+        #     "  if ! kill -0 $BIZ_PID 2>/dev/null; then break; fi; "
+        #     "  if command -v xdotool >/dev/null 2>&1; then "
+        #     "    xdotool search --name \"Mismatched version in config file\" windowactivate --sync key Return 2>/dev/null; "
+        #     "    xdotool search --name \"Couldn't initialize sound device\" windowactivate --sync key Return 2>/dev/null; "
+        #     "    xdotool search --name \"Welcome\" windowactivate --sync key Return 2>/dev/null; "
+        #     "  fi; "
+        #     "done; "
+        #     "wait $BIZ_PID"
+        # )
+        # inner_cmd = (
+        #     "pulseaudio --start --exit-idle-time=-1; "
+        #     "pactl load-module module-null-sink sink_name=DummySink >/dev/null 2>&1 || true; "
+        #     "export PULSE_SINK=DummySink; "
+        #     f"mono {shlex.quote(emu_hawk_exe)} "
+        #     f"--audiosync false --gdi --chromeless "
+        #     f"--lua {shlex.quote(lua_script)} {shlex.quote(self.rom_path)}"
+        # )
+        inner_cmd = (
+            "pulseaudio --start --exit-idle-time=-1; "
+            "pactl load-module module-null-sink sink_name=DummySink >/dev/null 2>&1 || true; "
+            "export PULSE_SINK=DummySink; "
+            f"mono {shlex.quote(emu_hawk_exe)} "
+            f"--audiosync false --gdi --chromeless "
+            f"--lua {shlex.quote(lua_script)} {shlex.quote(self.rom_path)} & "
+            "BIZ_PID=$!; "
+            "sleep 3; "
+            "xdotool search --onlyvisible --name '.*' key Return 2>/dev/null || true; "
+            "wait $BIZ_PID"
+        )
+
+        inner_cmd = (
+            f"mono {shlex.quote(emu_hawk_exe)} "
+            f"--audiosync false --gdi --chromeless "
+            f"--lua {shlex.quote(lua_script)} {shlex.quote(self.rom_path)}"
+        )
+
+    """

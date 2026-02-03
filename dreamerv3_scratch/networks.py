@@ -11,18 +11,19 @@ class Encoder(nn.Module):
         self.conv2 = nn.Conv2d(32, 64, 4, stride=2)
         self.conv3 = nn.Conv2d(64, 128, 4, stride=2)
         self.conv4 = nn.Conv2d(128, 256, 4, stride=2)
+        self.pool = nn.AdaptiveAvgPool2d((2, 2))
         
         # Flatten and project to embed_dim
-        # For 64x64, output of conv4 is usually 2x2x256 = 1024
+        # Adaptive pool ensures 2x2x256 = 1024 regardless of input size
         self.fc = nn.Linear(1024, embed_dim)
 
     def forward(self, x):
         # Normalize image to [-0.5, 0.5] if they are [0, 255]
-        # x = x.float() / 255.0 - 0.5 
         x = F.silu(self.conv1(x))
         x = F.silu(self.conv2(x))
         x = F.silu(self.conv3(x))
         x = F.silu(self.conv4(x))
+        x = self.pool(x)
         x = torch.flatten(x, start_dim=1)
         return self.fc(x)
 
@@ -34,6 +35,7 @@ class Decoder(nn.Module):
         self.deconv2 = nn.ConvTranspose2d(128, 64, 5, stride=2)
         self.deconv3 = nn.ConvTranspose2d(64, 32, 6, stride=2)
         self.deconv4 = nn.ConvTranspose2d(32, obs_shape[0], 6, stride=2)
+        self.out_shape = obs_shape
         # This is a bit arbitrary, but roughly maps state back to image
         # In practice, DreamerV3 architecture is more specific about kernel sizes
 
@@ -43,7 +45,10 @@ class Decoder(nn.Module):
         x = F.silu(self.deconv1(x))
         x = F.silu(self.deconv2(x))
         x = F.silu(self.deconv3(x))
-        return self.deconv4(x)
+        x = self.deconv4(x)
+        if x.shape[-2:] != self.out_shape[1:]:
+            x = F.interpolate(x, size=self.out_shape[1:], mode="bilinear", align_corners=False)
+        return x
 
 class RewardPredictor(nn.Module):
     def __init__(self, state_dim, num_bins=255):

@@ -1,6 +1,14 @@
 gymnasium
 numpy
 pillow
-pyautogui
-pygetwindow
+pyautogui; platform_system == "Windows"
+pygetwindow; platform_system == "Windows"
 opencv-python
+# RL and ML libraries
+torch
+stable-baselines3
+sb3-contrib
+optuna
+tqdm
+psutil
+retro
